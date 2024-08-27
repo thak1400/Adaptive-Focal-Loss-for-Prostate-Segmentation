@@ -1,0 +1,150 @@
+import gradio as gr
+import torch
+import cv2
+import numpy as np
+from networks.vit_seg_modeling import VisionTransformer as ViT_seg, CONFIGS
+from PIL import Image
+import tempfile
+import os
+
+# Base directory for models
+base_dir = os.path.join(os.path.dirname(__file__), ".." , 'model')
+
+# Paths to your model weights
+model_paths = {
+    "adaptiveFocal": os.path.join(base_dir, 'MicroSegNet_MicroUS224_R50-ViT-B_16_weight4_epo10_bs8_adaptiveFocal', 'epoch_9.pth'),
+    "AGBCE": os.path.join(base_dir, 'MicroSegNet_MicroUS224_R50-ViT-B_16_weight4_epo10_bs8_default', 'epoch_9.pth'),
+    "pyTFocal": os.path.join(base_dir, 'MicroSegNet_MicroUS224_R50-ViT-B_16_weight4_epo10_bs8_pyTFocal', 'epoch_9.pth')
+}
+
+def load_model(model_name):
+    config_vit = CONFIGS["R50-ViT-B_16"]
+    config_vit.n_classes = 1
+    config_vit.n_skip = 3
+    if "R50" in "R50-ViT-B_16":
+        config_vit.patches.grid = (int(224 / 16), int(224 / 16))
+    
+    net = ViT_seg(config_vit, img_size=224, num_classes=config_vit.n_classes).cuda()
+    checkpoint = torch.load(model_paths[model_name])
+    net.load_state_dict(checkpoint, strict=True)
+
+    return net
+
+def load_image(image_path):
+    image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE).astype(np.float32)
+    image = cv2.normalize(image, None, 0, 254, cv2.NORM_MINMAX).astype(np.uint8) 
+    return image
+
+def process_prediction(image, model):
+    patch_size = [224, 224]
+    prediction = np.zeros_like(image)
+
+    if len(image.shape) == 2:  
+        slice = image / 254.0  
+        x, y = slice.shape
+
+        if x != patch_size[0] or y != patch_size[1]:
+            slice = cv2.resize(slice, patch_size, interpolation=cv2.INTER_NEAREST)
+
+        input = torch.from_numpy(slice).unsqueeze(0).unsqueeze(0).float().cuda()
+        model.eval()
+        with torch.no_grad():
+            outputs, _, _, _ = model(input)
+            out = torch.sigmoid(outputs).squeeze().cpu().numpy()
+
+            if x != patch_size[0] or y != patch_size[1]:
+                pred = cv2.resize(out, (y, x), interpolation=cv2.INTER_NEAREST)
+            else:
+                pred = out
+
+            prediction = (pred > 0.5).astype(np.uint8)
+
+    else:  
+        for ind in range(image.shape[0]):
+            slice = image[ind, :, :] / 254.0 
+            x, y = slice.shape
+
+            if x != patch_size[0] or y != patch_size[1]:
+                slice = cv2.resize(slice, patch_size, interpolation=cv2.INTER_NEAREST)
+
+            input = torch.from_numpy(slice).unsqueeze(0).unsqueeze(0).float().cuda()
+            model.eval()
+            with torch.no_grad():
+                outputs, _, _, _ = model(input)
+                out = torch.sigmoid(outputs).squeeze().cpu().numpy()
+
+                if x != patch_size[0] or y != patch_size[1]:
+                    pred = cv2.resize(out, (y, x), interpolation=cv2.INTER_NEAREST)
+                else:
+                    pred = out
+
+                prediction[ind] = (pred > 0.5).astype(np.uint8)
+
+    return prediction
+
+def generate_contours(prediction):
+    if prediction.ndim == 2:  
+        binary_mask = prediction.astype(np.uint8) * 255
+        contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        return contours
+    elif prediction.ndim == 3:  
+        contours = []
+        for ind in range(prediction.shape[0]):
+            slice_pred = prediction[ind, :, :]
+            binary_mask = (slice_pred > 0).astype(np.uint8) * 255
+
+          
+            if binary_mask.shape[0] != prediction.shape[1] or binary_mask.shape[1] != prediction.shape[2]:
+                binary_mask = cv2.resize(binary_mask, (prediction.shape[2], prediction.shape[1]), interpolation=cv2.INTER_NEAREST)
+
+            slice_contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            contours.append(slice_contours)
+        return contours
+    else:
+        raise ValueError("Prediction must be either 2D or 3D.")
+
+
+def visualize_contours(image, contours, color):
+    contour_img = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+    cv2.drawContours(contour_img, contours, -1, color, 2)
+    return Image.fromarray(contour_img)
+
+def process_images(image_files, objectives):
+    result_files = []
+    displayed_images = []
+
+    for f in image_files:
+        original_img = load_image(f.name)
+        for objective in objectives:
+            model = load_model(objective)
+            prediction = process_prediction(original_img, model)
+            predicted_contours = generate_contours(prediction)
+            color = (0, 255, 0)
+            if objective == "adaptiveFocal":
+                color = (0, 0, 255)  
+            elif objective == "AGBCE":
+                color = (255, 0, 0)  
+            elif objective == "pyTFocal":
+                color = (255, 0, 255)  
+            
+            contour_img = visualize_contours(original_img, predicted_contours, color)
+            file_name = f"contour_{objective}_image{image_files.index(f)+1}.png"
+            temp_file = os.path.join(tempfile.gettempdir(), file_name)
+            contour_img.save(temp_file, format='PNG')
+
+            result_files.append(temp_file)
+            displayed_images.append(contour_img)
+
+    return displayed_images, result_files
+
+def gradio_interface(image_files, objectives):
+    displayed_images, result_files = process_images(image_files, objectives)
+    return displayed_images, result_files
+
+iface = gr.Interface(
+    fn=gradio_interface,
+    inputs=[gr.Files(label="Input Images"), gr.CheckboxGroup(choices=list(model_paths.keys()), label="Objectives")],
+    outputs=[gr.Gallery(label="Contour Images"), gr.File(label="Download Contour Images", type="filepath")],
+)
+
+iface.launch()
